@@ -1,0 +1,9 @@
+{"document":"employment_01.pdf","question":"What is the resignation notice period?","expected_answer":"30 days","expected_source":"Section 11.2","expected_page":18}
+{"document":"employment_01.pdf","question":"Does the contract automatically renew?","expected_answer":"Yes, unless notice is provided 60 days before expiry","expected_source":"Section 3.2","expected_page":4}
+{"document":"employment_01.pdf","question":"Who owns intellectual property created during employment?","expected_answer":"See the intellectual property provision","expected_source":"Section 9","expected_page":15}
+{"document":"lease_01.pdf","question":"When is rent due?","expected_answer":"The date specified in the rent payment clause","expected_source":"Rent section","expected_page":5}
+{"document":"lease_01.pdf","question":"What happens to the security deposit?","expected_answer":"Use the security deposit clause","expected_source":"Security Deposit section","expected_page":7}
+{"document":"nda_01.pdf","question":"How long does confidentiality continue?","expected_answer":"Use the confidentiality duration clause","expected_source":"Confidentiality section","expected_page":6}
+{"document":"service_01.pdf","question":"What happens if either party wants to terminate?","expected_answer":"Use the termination provision","expected_source":"Termination section","expected_page":12}
+{"document":"loan_01.pdf","question":"What is the payment deadline?","expected_answer":"Use the payment schedule","expected_source":"Payment section","expected_page":8}
+{"document":"unknown_question.pdf","question":"Does this document give me a refund right?","expected_answer":"NOT_FOUND","expected_source":null,"expected_page":null}
