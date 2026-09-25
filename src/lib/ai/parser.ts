@@ -117,6 +117,13 @@ export async function extractTextFromBuffer(
   };
 }
 
+// Module-level pre-compiled static regexes for high performance document parsing
+const PATTERN_SECTION = /(?:SECTION|Section|SEC\.|Sec\.|Article|ARTICLE|Clause)\s*(\d+(?:\.\d+)?)/i;
+const PATTERN_LEADING_NUM = /^(\d+(?:\.\d+)?)\.?\s+/;
+const PATTERN_NAMED_SECTION = /^(Rent|Security\s+Deposit|Confidentiality|Termination|Payment|Intellectual\s+Property|Indemnification|Governing\s+Law|Non-Compete|Warranties|Notices)\b/i;
+const PATTERN_DATE = /\b(?:(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}|\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})\b/gi;
+const OBLIGATION_KEYWORD_REGEX = /\b(shall|must|agree|agrees|required|will)\b/i;
+
 /**
  * Parses full extracted text into structured clauses, obligations, and dates
  * with accurate page and section indexing for grounded RAG retrieval.
@@ -130,6 +137,16 @@ export function analyzeDocumentContent(
   // Check if text has explicit form-feed page markers
   const pageSegments = text.split('\f');
   const hasPageMarkers = pageSegments.length > 1;
+
+  // Pre-calculate cumulative page boundary character lengths
+  const cumulativePageLengths: number[] = [];
+  if (hasPageMarkers) {
+    let acc = 0;
+    for (let i = 0; i < pageSegments.length; i++) {
+      acc += pageSegments[i].length;
+      cumulativePageLengths.push(acc);
+    }
+  }
 
   // Split into substantive paragraphs / clause chunks, filtering out any raw PDF syntax artifacts
   const rawParagraphs = text
@@ -145,61 +162,48 @@ export function analyzeDocumentContent(
   const totalLength = Math.max(1, text.length);
 
   rawParagraphs.forEach((para, idx) => {
-    // Determine accurate page number
+    // Determine accurate page number with pre-calculated boundaries
     let pageNumber = 1;
     if (hasPageMarkers) {
-      // Find which page segment contains this paragraph
-      let accumulated = 0;
-      for (let pIdx = 0; pIdx < pageSegments.length; pIdx++) {
-        accumulated += pageSegments[pIdx].length;
-        if (currentCumulativeLength <= accumulated) {
+      for (let pIdx = 0; pIdx < cumulativePageLengths.length; pIdx++) {
+        if (currentCumulativeLength <= cumulativePageLengths[pIdx]) {
           pageNumber = pIdx + 1;
           break;
         }
       }
     } else {
-      // Linear page interpolation based on character position
       pageNumber = Math.min(pageCount, Math.floor((currentCumulativeLength / totalLength) * pageCount) + 1);
     }
     currentCumulativeLength += para.length + 2;
 
     // Detect section numbering or named header
     let secNum: string | null = null;
-
-    // 1. Explicit Section / Article / Clause pattern: "Section 11.2", "Section 3.2", "Section 9", "Article 4"
-    const sectionMatch = para.match(/(?:SECTION|Section|SEC\.|Sec\.|Article|ARTICLE|Clause)\s*(\d+(?:\.\d+)?)/i);
+    const sectionMatch = para.match(PATTERN_SECTION);
     if (sectionMatch) {
       secNum = sectionMatch[1];
-    }
-
-    // 2. Leading numbered pattern: "11.2 Resignation", "3.2 Term", "9. Intellectual Property"
-    if (!secNum) {
-      const leadingNumMatch = para.match(/^(\d+(?:\.\d+)?)\.?\s+/);
+    } else {
+      const leadingNumMatch = para.match(PATTERN_LEADING_NUM);
       if (leadingNumMatch) {
         secNum = leadingNumMatch[1];
+      } else {
+        const namedMatch = para.match(PATTERN_NAMED_SECTION);
+        if (namedMatch) {
+          secNum = namedMatch[1];
+        }
       }
     }
 
-    // 3. Named section pattern (e.g. "Rent", "Security Deposit", "Confidentiality", "Termination", "Payment")
-    if (!secNum) {
-      const namedMatch = para.match(/^(Rent|Security\s+Deposit|Confidentiality|Termination|Payment|Intellectual\s+Property|Indemnification|Governing\s+Law|Non-Compete|Warranties|Notices)\b/i);
-      if (namedMatch) {
-        secNum = namedMatch[1];
-      }
-    }
-
-    // Fallback section designation if not explicitly labeled
     const displaySection = secNum
       ? (isNaN(Number(secNum[0])) ? secNum : `${secNum}`)
       : `${Math.floor(idx / 2) + 1}.${(idx % 2) + 1}`;
 
     const classification = classifyClause(para);
 
-    // Extract first sentence or title preview
     const firstSentence = para.split(/[.!?]\s+/)[0] || `${classification.category} Provision`;
     const cleanTitle = firstSentence.length > 70 ? firstSentence.substring(0, 67) + '...' : firstSentence;
 
     const clauseId = `cl-${documentId}-${idx}`;
+    const paraLower = para.toLowerCase();
 
     clauses.push({
       id: clauseId,
@@ -211,7 +215,7 @@ export function analyzeDocumentContent(
       originalText: para,
       plainEnglish: `This provision outlines ${classification.category.toLowerCase()} terms governing the parties under Section ${displaySection}.`,
       whoItAffects: classification.whoItAffects,
-      yourObligation: (para.toLowerCase().includes('shall') || para.toLowerCase().includes('must') || para.toLowerCase().includes('is required to'))
+      yourObligation: (paraLower.includes('shall') || paraLower.includes('must') || paraLower.includes('is required to'))
         ? `Obligation defined in Section ${displaySection}: ${cleanTitle}`
         : undefined,
       whenItApplies: `Under terms stated in Section ${displaySection}.`,
@@ -220,10 +224,10 @@ export function analyzeDocumentContent(
       verifyInstructions: 'Verify specific conditions and dates against your business expectations.'
     });
 
-    // 2. Real Date Extraction
-    const dateRegex = /\b(?:(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}|\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})\b/gi;
-    let match;
-    while ((match = dateRegex.exec(para)) !== null) {
+    // Extract Dates
+    PATTERN_DATE.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = PATTERN_DATE.exec(para)) !== null) {
       const dateStr = match[0];
       if (!dates.some(d => d.dateStr === dateStr)) {
         let eventType: ExtractedDate['eventType'] = 'OTHER';
@@ -245,37 +249,40 @@ export function analyzeDocumentContent(
       }
     }
 
-    // 3. Real Obligation Extraction
-    const sentences = para.split(/[.!?]\s+/);
-    sentences.forEach((sentence) => {
-      const sLower = sentence.toLowerCase();
-      if (
-        sLower.includes('shall ') ||
-        sLower.includes('must ') ||
-        sLower.includes('agrees to') ||
-        sLower.includes('agree to') ||
-        sLower.includes('is required to') ||
-        sLower.includes('will provide') ||
-        sLower.includes('will pay')
-      ) {
-        if (sentence.trim().length > 25 && sentence.trim().length < 240) {
-          const isUser = sLower.includes('employee') || sLower.includes('tenant') || sLower.includes('customer') || sLower.includes('client');
-          const isCounterparty = sLower.includes('employer') || sLower.includes('landlord') || sLower.includes('provider') || sLower.includes('company');
+    // Extract Obligations with fast-path keyword filter
+    if (OBLIGATION_KEYWORD_REGEX.test(para)) {
+      const sentences = para.split(/[.!?]\s+/);
+      for (let sIdx = 0; sIdx < sentences.length; sIdx++) {
+        const sentence = sentences[sIdx];
+        const sLower = sentence.toLowerCase();
+        if (
+          sLower.includes('shall ') ||
+          sLower.includes('must ') ||
+          sLower.includes('agrees to') ||
+          sLower.includes('agree to') ||
+          sLower.includes('is required to') ||
+          sLower.includes('will provide') ||
+          sLower.includes('will pay')
+        ) {
+          const trimmed = sentence.trim();
+          if (trimmed.length > 25 && trimmed.length < 240) {
+            const isCounterparty = sLower.includes('employer') || sLower.includes('landlord') || sLower.includes('provider') || sLower.includes('company');
 
-          obligations.push({
-            id: `ob-${documentId}-${obligations.length}`,
-            documentId,
-            party: isCounterparty ? 'COUNTERPARTY' : 'USER',
-            partyLabel: isCounterparty ? 'Counterparty' : 'You (Obligated Party)',
-            description: sentence.trim(),
-            deadline: `As defined in Section ${displaySection}`,
-            sourceSection: `Section ${displaySection}`,
-            sourcePage: pageNumber,
-            isCompleted: false
-          });
+            obligations.push({
+              id: `ob-${documentId}-${obligations.length}`,
+              documentId,
+              party: isCounterparty ? 'COUNTERPARTY' : 'USER',
+              partyLabel: isCounterparty ? 'Counterparty' : 'You (Obligated Party)',
+              description: trimmed,
+              deadline: `As defined in Section ${displaySection}`,
+              sourceSection: `Section ${displaySection}`,
+              sourcePage: pageNumber,
+              isCompleted: false
+            });
+          }
         }
       }
-    });
+    }
   });
 
   const summary = `Analyzed ${docType} comprising ${pageCount} page(s), ${clauses.length} detected clauses, ${dates.length} timeline milestones, and ${obligations.length} actionable obligations.`;
@@ -283,7 +290,7 @@ export function analyzeDocumentContent(
   return {
     text,
     pageCount,
-    clauses: clauses.slice(0, 150), // Store full clause coverage (up to 150) for RAG
+    clauses: clauses.slice(0, 150),
     obligations: obligations.slice(0, 30),
     dates: dates.slice(0, 20),
     summary

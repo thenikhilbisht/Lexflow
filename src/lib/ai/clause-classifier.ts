@@ -124,9 +124,9 @@ export function classifyClause(text: string): {
   const lower = text.toLowerCase();
 
   for (const rule of CLAUSE_TAXONOMY) {
-    // Check regex
-    for (const pat of rule.patterns) {
-      if (pat.test(text)) {
+    // Check keywords first (fast substring lookup)
+    for (let i = 0; i < rule.keywords.length; i++) {
+      if (lower.includes(rule.keywords[i])) {
         return {
           category: rule.category,
           attentionLevel: rule.defaultAttention,
@@ -134,9 +134,9 @@ export function classifyClause(text: string): {
         };
       }
     }
-    // Check keywords
-    for (const kw of rule.keywords) {
-      if (lower.includes(kw)) {
+    // Fallback to regex evaluation
+    for (let i = 0; i < rule.patterns.length; i++) {
+      if (rule.patterns[i].test(text)) {
         return {
           category: rule.category,
           attentionLevel: rule.defaultAttention,

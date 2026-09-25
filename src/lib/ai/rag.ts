@@ -76,6 +76,55 @@ export function rewriteQueryWithContext(query: string, history: ChatMessage[] = 
   return qTrim;
 }
 
+// Module-level static stop words set to avoid allocations per search query
+const STOP_WORDS = new Set([
+  'a', 'an', 'the', 'in', 'on', 'at', 'to', 'for', 'of', 'and', 'or', 'is', 'are',
+  'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did',
+  'can', 'could', 'should', 'would', 'will', 'shall', 'what', 'when', 'where', 'which',
+  'who', 'whom', 'whose', 'why', 'how', 'me', 'my', 'i', 'you', 'your', 'about',
+  'this', 'that', 'these', 'those', 'there', 'here', 'all', 'any', 'both', 'each',
+  'every', 'other', 'some', 'such', 'its', 'our', 'their', 'more', 'most', 'same',
+  'so', 'than', 'too', 'very', 'also', 'just', 'only', 'own',
+  'document', 'documents', 'agreement', 'agreements', 'contract', 'contracts',
+  'party', 'parties', 'section', 'sections', 'clause', 'clauses', 'provision', 'provisions',
+  'provide', 'provides', 'provided', 'give', 'gives', 'given', 'right', 'rights',
+  'under', 'herein', 'thereof', 'therein', 'hereunder', 'thereto', 'item', 'items', 'with', 'from', 'into'
+]);
+
+// WeakMap search index cache to store pre-lowercased clause fields for sub-millisecond scoring
+interface ClauseSearchIndex {
+  titleLower: string;
+  catLower: string;
+  textLower: string;
+  sectionStr: string;
+  combinedLower: string;
+}
+
+const clauseSearchIndexCache = new WeakMap<Clause, ClauseSearchIndex>();
+
+function getClauseSearchIndex(c: Clause): ClauseSearchIndex {
+  let cached = clauseSearchIndexCache.get(c);
+  if (!cached) {
+    const titleLower = c.title.toLowerCase();
+    const catLower = c.category.toLowerCase();
+    const textLower = c.originalText.toLowerCase();
+    const plainLower = (c.plainEnglish || '').toLowerCase();
+    const sectionStr = `section ${c.sectionNumber}`.toLowerCase();
+    const combinedLower = `${titleLower} ${catLower} ${textLower} ${plainLower}`;
+    cached = { titleLower, catLower, textLower, sectionStr, combinedLower };
+    clauseSearchIndexCache.set(c, cached);
+  }
+  return cached;
+}
+
+// Fast string-based negation check without dynamic RegExp construction
+function isNegatedInText(textLower: string, term: string): boolean {
+  const idx = textLower.indexOf(term);
+  if (idx <= 0) return false;
+  const prefix = textLower.substring(Math.max(0, idx - 45), idx);
+  return prefix.includes('without') || prefix.includes('does not specify') || prefix.includes('no provision') || prefix.includes('not entitled');
+}
+
 /**
  * Scores and retrieves relevant clauses using hybrid BM25-style keyword matching
  * and domain-specific semantic expansion.
@@ -89,20 +138,6 @@ export function retrieveRelevantClauses(
 
   const qLower = rawQuery.toLowerCase();
 
-  const STOP_WORDS = new Set([
-    'a', 'an', 'the', 'in', 'on', 'at', 'to', 'for', 'of', 'and', 'or', 'is', 'are',
-    'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did',
-    'can', 'could', 'should', 'would', 'will', 'shall', 'what', 'when', 'where', 'which',
-    'who', 'whom', 'whose', 'why', 'how', 'me', 'my', 'i', 'you', 'your', 'about',
-    'this', 'that', 'these', 'those', 'there', 'here', 'all', 'any', 'both', 'each',
-    'every', 'other', 'some', 'such', 'its', 'our', 'their', 'more', 'most', 'same',
-    'so', 'than', 'too', 'very', 'also', 'just', 'only', 'own',
-    'document', 'documents', 'agreement', 'agreements', 'contract', 'contracts',
-    'party', 'parties', 'section', 'sections', 'clause', 'clauses', 'provision', 'provisions',
-    'provide', 'provides', 'provided', 'give', 'gives', 'given', 'right', 'rights',
-    'under', 'herein', 'thereof', 'therein', 'hereunder', 'thereto', 'item', 'items', 'with', 'from', 'into'
-  ]);
-
   const rawWords = qLower
     .replace(/[^\w\s]/g, ' ')
     .split(/\s+/)
@@ -115,79 +150,67 @@ export function retrieveRelevantClauses(
   // Expand with synonyms
   const queryTerms = new Set<string>(rawWords);
   for (const w of rawWords) {
-    if (LEGAL_SYNONYMS[w]) {
-      for (const syn of LEGAL_SYNONYMS[w]) {
-        queryTerms.add(syn.toLowerCase());
+    const syns = LEGAL_SYNONYMS[w];
+    if (syns) {
+      for (let i = 0; i < syns.length; i++) {
+        queryTerms.add(syns[i].toLowerCase());
       }
     }
   }
 
   // Check if at least one substantive query term or synonym is present in the document
-  const hasSubstantiveTermInDoc = clauses.some(c => {
-    const combined = `${c.title} ${c.category} ${c.originalText} ${c.plainEnglish}`.toLowerCase();
+  let hasSubstantiveTermInDoc = false;
+  for (let i = 0; i < clauses.length; i++) {
+    const idx = getClauseSearchIndex(clauses[i]);
     for (const term of queryTerms) {
-      if (combined.includes(term)) {
-        // Exclude explicit negation ("without any mention of <term>", "does not specify <term>")
-        const negationPattern = new RegExp(`(without\\s+(any\\s+)?mention\\s+of|does\\s+not\\s+specify|no\\s+provision\\s+for|not\\s+entitled\\s+to)\\s+[^.]*?${term}`, 'i');
-        if (!negationPattern.test(combined)) {
-          return true;
-        }
+      if (idx.combinedLower.includes(term) && !isNegatedInText(idx.combinedLower, term)) {
+        hasSubstantiveTermInDoc = true;
+        break;
       }
     }
-    return false;
-  });
+    if (hasSubstantiveTermInDoc) break;
+  }
 
   if (!hasSubstantiveTermInDoc) {
     return [];
   }
 
-  // Score each clause
+  // Score each clause using pre-indexed search representation
   const scored = clauses.map(c => {
     let score = 0;
     const reasons: string[] = [];
-
-    const titleLower = c.title.toLowerCase();
-    const catLower = c.category.toLowerCase();
-    const textLower = c.originalText.toLowerCase();
-    const sectionStr = `section ${c.sectionNumber}`.toLowerCase();
+    const idx = getClauseSearchIndex(c);
 
     // 1. Direct phrase match in clause text (+15)
-    if (rawQuery.length > 8 && textLower.includes(rawQuery.toLowerCase())) {
+    if (rawQuery.length > 8 && idx.textLower.includes(qLower)) {
       score += 15;
       reasons.push('exact phrase in text');
     }
 
     // 2. Section number match (+12)
-    if (c.sectionNumber && (qLower.includes(c.sectionNumber.toLowerCase()) || qLower.includes(sectionStr))) {
+    if (c.sectionNumber && (qLower.includes(c.sectionNumber.toLowerCase()) || qLower.includes(idx.sectionStr))) {
       score += 12;
       reasons.push(`matches Section ${c.sectionNumber}`);
     }
 
-    // 3. Title match (+8 per matching term)
+    // 3. Title & Category match (+8 / +6 per matching term)
     for (const term of queryTerms) {
-      if (titleLower.includes(term)) {
+      if (idx.titleLower.includes(term)) {
         score += 8;
         reasons.push(`title contains "${term}"`);
       }
-    }
-
-    // 4. Category match (+6 per term)
-    for (const term of queryTerms) {
-      if (catLower.includes(term)) {
+      if (idx.catLower.includes(term)) {
         score += 6;
         reasons.push(`category "${c.category}" matches "${term}"`);
       }
     }
 
-    // 5. Text keyword density & occurrences (excluding negations)
+    // 4. Text keyword density & occurrences (excluding negations)
     for (const term of queryTerms) {
-      if (textLower.includes(term)) {
-        const negationRegex = new RegExp(`(without\\s+(any\\s+)?mention\\s+of|does\\s+not\\s+specify|no\\s+provision\\s+for)\\s+[^.]*?${term}`, 'i');
-        if (!negationRegex.test(textLower)) {
-          const matches = textLower.split(term).length - 1;
-          score += Math.min(10, matches * 3);
-          reasons.push(`text mentions "${term}" (${matches}x)`);
-        }
+      if (idx.textLower.includes(term) && !isNegatedInText(idx.textLower, term)) {
+        const matches = idx.textLower.split(term).length - 1;
+        score += Math.min(10, matches * 3);
+        reasons.push(`text mentions "${term}" (${matches}x)`);
       }
     }
 
