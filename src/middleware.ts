@@ -1,80 +1,102 @@
+export const runtime = 'nodejs';
+
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
+import { verifySessionToken } from '@/lib/auth/token';
 
 const SESSION_COOKIE_NAME = 'lexiguide_session';
 
-interface SessionPayload {
-  userId: string;
-  email: string;
-  role: 'USER' | 'ADMIN' | 'SUPER_ADMIN';
-  expiresAt: number;
-}
+const SECURITY_HEADERS = {
+  'X-Frame-Options': 'DENY',
+  'X-Content-Type-Options': 'nosniff',
+  'X-XSS-Protection': '1; mode=block',
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+  'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' https://generativelanguage.googleapis.com;"
+};
 
-function parseSessionCookie(token: string): SessionPayload | null {
-  try {
-    const parts = token.split('.');
-    if (parts.length !== 2) return null;
-
-    // Decode base64url payload
-    const base64 = parts[0].replace(/-/g, '+').replace(/_/g, '/');
-    const jsonStr = atob(base64);
-    const payload = JSON.parse(jsonStr);
-
-    if (Date.now() > payload.expiresAt) {
-      return null;
-    }
-
-    return payload;
-  } catch (e) {
-    return null;
-  }
+function applySecurityHeaders(res: NextResponse): NextResponse {
+  Object.entries(SECURITY_HEADERS).forEach(([key, val]) => {
+    res.headers.set(key, val);
+  });
+  return res;
 }
 
 export function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
   const sessionCookie = request.cookies.get(SESSION_COOKIE_NAME);
-  const session = sessionCookie?.value ? parseSessionCookie(sessionCookie.value) : null;
+  const session = sessionCookie?.value ? verifySessionToken(sessionCookie.value) : null;
 
   // 1. Protected User App Routes (/app/*)
   if (pathname.startsWith('/app')) {
     if (!session) {
       const loginUrl = new URL('/login', request.url);
       loginUrl.searchParams.set('redirect', pathname);
-      return NextResponse.redirect(loginUrl);
+      return applySecurityHeaders(NextResponse.redirect(loginUrl));
     }
-    return NextResponse.next();
+    return applySecurityHeaders(NextResponse.next());
   }
 
-  // 2. Protected Admin Routes (/admin/*)
+  // 2. Protected Admin App Routes (/admin/*)
   if (pathname.startsWith('/admin')) {
     if (!session) {
       const loginUrl = new URL('/login', request.url);
       loginUrl.searchParams.set('redirect', pathname);
-      return NextResponse.redirect(loginUrl);
+      return applySecurityHeaders(NextResponse.redirect(loginUrl));
     }
 
-    // Strict RBAC: normal users can NEVER access /admin
     if (session.role !== 'ADMIN' && session.role !== 'SUPER_ADMIN') {
-      // Redirect unauthorized users to user app
-      return NextResponse.redirect(new URL('/app', request.url));
+      return applySecurityHeaders(NextResponse.redirect(new URL('/app', request.url)));
     }
 
-    return NextResponse.next();
+    return applySecurityHeaders(NextResponse.next());
   }
 
-  // 3. Auth Routes (/login, /register) when already logged in
+  // 3. Protected Admin API Routes (/api/admin/*)
+  if (pathname.startsWith('/api/admin')) {
+    if (!session) {
+      return applySecurityHeaders(NextResponse.json({ error: 'Authentication required' }, { status: 401 }));
+    }
+    if (session.role !== 'ADMIN' && session.role !== 'SUPER_ADMIN') {
+      return applySecurityHeaders(NextResponse.json({ error: 'Forbidden: Insufficient privileges' }, { status: 403 }));
+    }
+    return applySecurityHeaders(NextResponse.next());
+  }
+
+  // 4. Protected User API Routes (/api/documents/*, /api/compare/*, /api/checklists/*, /api/timeline/*)
+  if (
+    pathname.startsWith('/api/documents') ||
+    pathname.startsWith('/api/compare') ||
+    pathname.startsWith('/api/checklists') ||
+    pathname.startsWith('/api/timeline')
+  ) {
+    if (!session) {
+      return applySecurityHeaders(NextResponse.json({ error: 'Authentication required' }, { status: 401 }));
+    }
+    return applySecurityHeaders(NextResponse.next());
+  }
+
+  // 5. Auth Routes (/login, /register) when already authenticated
   if (pathname === '/login' || pathname === '/register') {
     if (session) {
-      if (session.role === 'ADMIN' || session.role === 'SUPER_ADMIN') {
-        return NextResponse.redirect(new URL('/admin', request.url));
-      }
-      return NextResponse.redirect(new URL('/app', request.url));
+      const dest = (session.role === 'ADMIN' || session.role === 'SUPER_ADMIN') ? '/admin' : '/app';
+      return applySecurityHeaders(NextResponse.redirect(new URL(dest, request.url)));
     }
   }
 
-  return NextResponse.next();
+  return applySecurityHeaders(NextResponse.next());
 }
 
 export const config = {
-  matcher: ['/app/:path*', '/admin/:path*', '/login', '/register']
+  matcher: [
+    '/app/:path*',
+    '/admin/:path*',
+    '/login',
+    '/register',
+    '/api/admin/:path*',
+    '/api/documents/:path*',
+    '/api/compare/:path*',
+    '/api/checklists/:path*',
+    '/api/timeline/:path*'
+  ]
 };

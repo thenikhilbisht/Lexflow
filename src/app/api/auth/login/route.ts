@@ -1,9 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { verifyPassword, createSessionToken, getSessionCookieOptions } from '@/lib/auth';
+import { checkRateLimit } from '@/lib/rate-limit';
 
 export async function POST(req: NextRequest) {
   try {
+    const ip = req.headers.get('x-forwarded-for') || '127.0.0.1';
+    const rateCheck = checkRateLimit(`login:${ip}`, { intervalMs: 60 * 1000, maxRequests: 10 });
+    if (!rateCheck.success) {
+      return NextResponse.json(
+        { error: 'Too many login attempts. Please try again in a minute.' },
+        { status: 429, headers: { 'Retry-After': '60' } }
+      );
+    }
+
     const body = await req.json();
     const { email, password } = body;
 
